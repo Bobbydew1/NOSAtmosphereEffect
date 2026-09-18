@@ -8,7 +8,10 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.opengl.GLSurfaceView
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.animation.LinearInterpolator
@@ -91,6 +94,15 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
         private var keyguardLookupAttempted = false
         private var keyguardFailureLogged = false
 
+        // --- Post-unlock debounce state ---
+        // Guards against OEM keyguard-dismiss transitions (observed after
+        // in-display fingerprint unlock while the screen was off) that briefly
+        // report the keyguard as locked again immediately after a genuine
+        // unlock, causing a spurious re-blur.
+        private val mainHandler = Handler(Looper.getMainLooper())
+        private var lastUnlockAtMs = 0L
+        private val postUnlockRecheckRunnable = Runnable { recheckLockStateAfterGraceWindow() }
+
         private val events = WallpaperEventController(
             context = this@AnimatedEffectWallpaperService,
             logTag = logTag,
@@ -156,6 +168,7 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
             events.close()
             animator?.cancel()
             animator = null
+            mainHandler.removeCallbacks(postUnlockRecheckRunnable)
             try {
                 super.onDestroy()
             } finally {
@@ -200,13 +213,14 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
             }
 
             val locked = isKeyguardLocked()
-            events.setLocked(locked)
-            if (locked) {
-                animator?.cancel()
-                renderer?.let { setEffectProgress(it, lockedProgress) }
-                requestRender()
+            if (locked && isWithinPostUnlockGrace()) {
+                // Don't trust an immediate "locked" reading that shows up right
+                // after a genuine unlock — re-verify shortly instead of
+                // re-blurring on what is likely a stale/racy keyguard state.
+                mainHandler.removeCallbacks(postUnlockRecheckRunnable)
+                mainHandler.postDelayed(postUnlockRecheckRunnable, POST_UNLOCK_RECHECK_DELAY_MS)
             } else {
-                snapToHomeState()
+                applyLockState(locked)
             }
         }
 
@@ -327,6 +341,11 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
                 return
             }
 
+            // Mark this as a genuine, confirmed unlock so a stale "locked"
+            // reading that arrives moments later (see onVisibilityChanged)
+            // doesn't immediately re-blur the wallpaper.
+            lastUnlockAtMs = SystemClock.elapsedRealtime()
+
             if (!behavior.transitionsEnabled) {
                 animator?.cancel()
                 animator = null
@@ -373,6 +392,26 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
                 }
             }
             requestRender()
+        }
+
+        private fun applyLockState(locked: Boolean) {
+            events.setLocked(locked)
+            if (locked) {
+                animator?.cancel()
+                renderer?.let { setEffectProgress(it, lockedProgress) }
+                requestRender()
+            } else {
+                snapToHomeState()
+            }
+        }
+
+        private fun recheckLockStateAfterGraceWindow() {
+            applyLockState(isKeyguardLocked())
+        }
+
+        private fun isWithinPostUnlockGrace(): Boolean {
+            return lastUnlockAtMs != 0L &&
+                SystemClock.elapsedRealtime() - lastUnlockAtMs < POST_UNLOCK_GRACE_MS
         }
 
         private fun applyFixedState(
@@ -551,6 +590,8 @@ abstract class AnimatedEffectWallpaperService<R : Any> : GLWallpaperService() {
         const val DEFAULT_LOCK_DELAY_MS = 800L
         const val SAMSUNG_POLL_INTERVAL_MS = 30_000L
         const val SAMSUNG_LOCK_DELAY_MS = 0L
+        const val POST_UNLOCK_GRACE_MS = 1_500L
+        const val POST_UNLOCK_RECHECK_DELAY_MS = 200L
     }
 }
 
